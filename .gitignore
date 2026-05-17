@@ -21,3 +21,10 @@ __pycache__/
 *.wav
 *.mp3
 *.csv
+
+#Programa para grabar audio
+audio_detection.py
+
+#Carpeta de grabaciones
+mi_dataset/
+
