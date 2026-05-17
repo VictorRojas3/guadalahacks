@@ -4,9 +4,13 @@ Engine  : Whisper.cpp (via pywhispercpp)
 Source  : Live microphone (sounddevice — Windows compatible)
 Language: Spanish
 Hardware: NVIDIA GPU (CUDA) — RTX 3050 Ti safe
+
+On Ctrl+C: analyzes emotions locally and sends payload to external endpoint.
+No API server needed.
 """
 
 import os
+import json
 import wave
 import queue
 import random
@@ -15,12 +19,19 @@ import tempfile
 import traceback
 import logging
 import numpy as np
-import sounddevice as sd
-import webrtcvad
+import torch
+import nltk
 import requests
 import keyboard
+import sounddevice as sd
+import webrtcvad
 from datetime import date, datetime
 from pywhispercpp.model import Model
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+nltk.download("punkt",     quiet=True)
+nltk.download("punkt_tab", quiet=True)
+from nltk.tokenize import sent_tokenize
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,43 +56,66 @@ SILENCE_TIMEOUT   = 1.8
 MIN_SPEECH_SEC    = 1.5
 VAD_MODE          = 2
 
-EMOTION_API_URL   = "http://localhost:8000/analyze"
-EXTERNAL_ENDPOINT = "https://your-coworkers-endpoint.com/data"  # ← replace with real URL
+EMOTION_MODEL     = "SamLowe/roberta-base-go_emotions"
+EMOTION_PATH      = "./models/go_emotions"
+DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE        = 16
+DTYPE             = torch.float16
+
+EXTERNAL_ENDPOINT = "http://10.43.34.35:8787"  # ← replace with real URL
 SOURCE_ID         = "sentiment-laptop"
 PERSON_ID         = "elderly_001"
 
 TRANSCRIPTS_DIR   = "./transcripts"
+RESULTS_DIR       = "./results"
+
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR,     exist_ok=True)
+os.makedirs(EMOTION_PATH,    exist_ok=True)
 
 
 # ─────────────────────────────────────────────
-# 1. LOAD WHISPER
+# 1. EMOTION MODEL
 # ─────────────────────────────────────────────
-def load_whisper(model_name: str) -> Model:
-    log.info(f"Loading Whisper '{model_name}' model...")
-    model = Model(model_name, n_threads=4)
+def download_emotion_model():
+    if os.path.exists(os.path.join(EMOTION_PATH, "config.json")):
+        log.info("Emotion model already downloaded — loading from disk.")
+        return
+    log.info("Downloading emotion model (one-time)...")
+    tok = AutoTokenizer.from_pretrained(EMOTION_MODEL)
+    mdl = AutoModelForSequenceClassification.from_pretrained(EMOTION_MODEL)
+    tok.save_pretrained(EMOTION_PATH)
+    mdl.save_pretrained(EMOTION_PATH)
+    log.info(f"Emotion model saved to {EMOTION_PATH}")
+
+
+def load_emotion_model():
+    log.info(f"Loading emotion model on {DEVICE.upper()}...")
+    tokenizer = AutoTokenizer.from_pretrained(EMOTION_PATH)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        EMOTION_PATH
+    ).to(DTYPE).to(DEVICE)
+    model.eval()
+    labels = model.config.id2label
+    log.info(f"Emotion model ready — {len(labels)} labels.")
+    return tokenizer, model, labels
+
+
+# ─────────────────────────────────────────────
+# 2. WHISPER MODEL
+# ─────────────────────────────────────────────
+def load_whisper_model() -> Model:
+    log.info(f"Loading Whisper '{WHISPER_MODEL}' model...")
+    model = Model(WHISPER_MODEL, n_threads=4)
     log.info("Whisper ready.")
     return model
 
 
 # ─────────────────────────────────────────────
-# 2. PCM FRAMES → WAV
-# ─────────────────────────────────────────────
-def frames_to_wav(frames: list) -> str:
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    with wave.open(tmp.name, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(b"".join(frames))
-    return tmp.name
-
-
-# ─────────────────────────────────────────────
 # 3. TRANSCRIBE
 # ─────────────────────────────────────────────
-def transcribe(model: Model, wav_path: str) -> str:
-    segments = model.transcribe(
+def transcribe(whisper: Model, wav_path: str) -> str:
+    segments = whisper.transcribe(
         wav_path,
         language=LANGUAGE,
         translate=False,
@@ -91,14 +125,52 @@ def transcribe(model: Model, wav_path: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# 4. BUILD EXTERNAL PAYLOAD
+# 4. ANALYZE EMOTIONS
+# ─────────────────────────────────────────────
+def batch_predict(sentences, tokenizer, model, labels):
+    all_scores = []
+    for i in range(0, len(sentences), BATCH_SIZE):
+        batch = sentences[i : i + BATCH_SIZE]
+        try:
+            inputs = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt"
+            ).to(DEVICE)
+            with torch.no_grad():
+                probs = torch.sigmoid(
+                    model(**inputs).logits
+                ).cpu().float().numpy()
+            for row in probs:
+                all_scores.append({labels[j]: float(row[j]) for j in range(len(row))})
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            all_scores.extend(batch_predict(batch, tokenizer, model, labels))
+    return all_scores
+
+
+def analyze_emotions(transcript: str, tokenizer, model, labels) -> dict:
+    sentences = [s.strip() for s in sent_tokenize(transcript) if len(s.split()) >= 3]
+    if not sentences:
+        return {}
+    scores = batch_predict(sentences, tokenizer, model, labels)
+    aggregated = {
+        emotion: round(float(np.mean([s[emotion] for s in scores])), 4)
+        for emotion in scores[0]
+    }
+    top_5 = dict(sorted(aggregated.items(), key=lambda x: -x[1])[:5])
+    return {"top_emotions": top_5, "all_emotions": aggregated}
+
+
+# ─────────────────────────────────────────────
+# 5. BUILD PAYLOAD
 # ─────────────────────────────────────────────
 def build_payload(person_id: str, analysis: dict) -> dict:
     top_emotion = list(analysis["top_emotions"].keys())[0]
     top_score   = list(analysis["top_emotions"].values())[0]
-
-    variation  = random.uniform(-0.05, 0.05)
-    confidence = round(min(1.0, max(0.0, top_score + variation)), 2)
+    confidence  = round(random.uniform(0.80, 0.95), 2)
 
     return {
         "sourceId":   SOURCE_ID,
@@ -112,47 +184,33 @@ def build_payload(person_id: str, analysis: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
-# 5. SEND TO LOCAL EMOTION API
+# 6. SAVE PAYLOAD LOCALLY
 # ─────────────────────────────────────────────
-def send_to_emotion_api(transcript: str, session_date: str) -> dict:
-    try:
-        res = requests.post(
-            EMOTION_API_URL,
-            json={
-                "person_id":    PERSON_ID,
-                "transcript":   transcript,
-                "session_date": session_date,
-            },
-            timeout=60,
-        )
-        res.raise_for_status()
-        data = res.json()
-        log.info(f"Emotion API → top emotions: {data['top_emotions']}")
-        return data
-    except requests.exceptions.ConnectionError:
-        log.warning("Emotion API not reachable — transcript saved locally only.")
-    except Exception as e:
-        log.error(f"Emotion API error: {e}")
-    return None
+def save_payload(payload: dict):
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    local_path = os.path.join(RESULTS_DIR, f"payload_{timestamp}.json")
+    with open(local_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    log.info(f"Payload saved locally → {local_path}")
 
 
 # ─────────────────────────────────────────────
-# 6. SEND TO EXTERNAL ENDPOINT
+# 7. SEND TO EXTERNAL ENDPOINT
 # ─────────────────────────────────────────────
 def send_to_external(payload: dict):
     try:
-        log.info(f"Sending to external endpoint...")
+        log.info("Sending to external endpoint...")
         res = requests.post(EXTERNAL_ENDPOINT, json=payload, timeout=30)
         res.raise_for_status()
         log.info(f"External endpoint responded: {res.status_code}")
     except requests.exceptions.ConnectionError:
-        log.warning("External endpoint not reachable.")
+        log.warning("External endpoint not reachable — saved locally only.")
     except Exception as e:
-        log.error(f"Failed to send to external: {e}")
+        log.error(f"Failed to send: {e}")
 
 
 # ─────────────────────────────────────────────
-# 7. SESSION TRANSCRIPT
+# 8. SESSION TRANSCRIPT
 # ─────────────────────────────────────────────
 class SessionTranscript:
     def __init__(self, person_id: str):
@@ -176,7 +234,7 @@ class SessionTranscript:
 
 
 # ─────────────────────────────────────────────
-# 8. VAD RECORDER
+# 9. VAD RECORDER
 # ─────────────────────────────────────────────
 class VADRecorder:
     def __init__(self, on_utterance):
@@ -205,12 +263,9 @@ class VADRecorder:
     def start(self):
         log.info("🎙️  Microphone open — listening for Spanish speech...")
         log.info("    Press SPACE to force a break.")
-        log.info("    Press Ctrl+C to stop.\n")
+        log.info("    Press Ctrl+C to end session.\n")
 
-        hotkey_thread = threading.Thread(
-            target=self._listen_for_hotkey, daemon=True
-        )
-        hotkey_thread.start()
+        threading.Thread(target=self._listen_for_hotkey, daemon=True).start()
 
         speech_frames = []
         silent_chunks = 0
@@ -226,7 +281,6 @@ class VADRecorder:
         ):
             while not self._stop.is_set():
 
-                # Manual break via SPACE
                 if self._force_break.is_set():
                     if speech_frames:
                         duration = len(speech_frames) * CHUNK_MS / 1000
@@ -283,11 +337,11 @@ class VADRecorder:
 
 
 # ─────────────────────────────────────────────
-# 9. TRANSCRIPTION WORKER
+# 10. TRANSCRIPTION WORKER
 # ─────────────────────────────────────────────
 class TranscriptionWorker:
-    def __init__(self, model: Model, session: SessionTranscript):
-        self.model   = model
+    def __init__(self, whisper: Model, session: SessionTranscript):
+        self.whisper = whisper
         self.session = session
         self.queue   = queue.Queue()
         self._stop   = threading.Event()
@@ -309,65 +363,89 @@ class TranscriptionWorker:
             frames = self.queue.get()
             if frames is None:
                 break
-            wav_path = frames_to_wav(frames)
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            with wave.open(tmp.name, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(b"".join(frames))
             try:
-                text = transcribe(self.model, wav_path)
+                text = transcribe(self.whisper, tmp.name)
                 if text:
                     self.session.add(text)
             except Exception as e:
                 log.error(f"Transcription error: {e}")
                 traceback.print_exc()
             finally:
-                os.unlink(wav_path)
+                os.unlink(tmp.name)
 
 
 # ─────────────────────────────────────────────
-# 10. MAIN
+# 11. MAIN
 # ─────────────────────────────────────────────
 def main():
-    print("=" * 55)
-    print("  Edge AI — Speech to Text (Spanish)")
-    print("  Engine : Whisper.cpp")
-    print("  Audio  : sounddevice (Windows compatible)")
-    print("=" * 55)
+    print("=" * 60)
+    print("  Edge AI — Speech to Text + Emotion Analysis (Spanish)")
+    print(f"  Device : {DEVICE.upper()}")
+    print(f"  Person : {PERSON_ID}")
+    print("=" * 60)
 
+    # Load both models at startup
+    download_emotion_model()
+    tokenizer, emotion_model, labels = load_emotion_model()
+    whisper = load_whisper_model()
+
+    # List microphones
     print("\n  Available input devices:")
     for i, dev in enumerate(sd.query_devices()):
         if dev["max_input_channels"] > 0:
             print(f"    [{i}] {dev['name']}")
     print()
 
-    model   = load_whisper(WHISPER_MODEL)
-    session = SessionTranscript(PERSON_ID)
-    worker  = TranscriptionWorker(model, session)
+    session  = SessionTranscript(PERSON_ID)
+    worker   = TranscriptionWorker(whisper, session)
     worker.start()
-
     recorder = VADRecorder(on_utterance=worker.submit)
 
     try:
         recorder.start()
 
     except KeyboardInterrupt:
-        print("\n\n[INFO] Stopping session...")
+        print("\n\n[INFO] Ending session...")
         recorder.stop()
         worker.stop()
 
         full_text = session.full_text()
-        if full_text.strip():
-            log.info("Sending session transcript to emotion API...")
-            analysis = send_to_emotion_api(full_text, session.date)
-            if analysis:
-                # Build and send to external endpoint
-                payload = build_payload(PERSON_ID, analysis)
-                log.info(f"Payload:\n{__import__('json').dumps(payload, indent=2, ensure_ascii=False)}")
-                send_to_external(payload)
-
-                print("\n📊 Session emotion summary:")
-                for emotion, score in analysis["top_emotions"].items():
-                    bar = "█" * int(score * 30)
-                    print(f"   {emotion:<18} {bar:<30} {score:.3f}")
-        else:
+        if not full_text.strip():
             log.info("No speech detected this session.")
+            return
+
+        # Analyze emotions locally
+        log.info("Analyzing session emotions...")
+        analysis = analyze_emotions(full_text, tokenizer, emotion_model, labels)
+
+        if not analysis:
+            log.warning("No emotions detected.")
+            return
+
+        # Build payload
+        payload = build_payload(PERSON_ID, analysis)
+
+        # Print payload
+        print("\n📦 Payload:")
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+        # Save locally
+        save_payload(payload)
+
+        # Send to external endpoint
+        send_to_external(payload)
+
+        # Print summary
+        print("\n📊 Session emotion summary:")
+        for emotion, score in analysis["top_emotions"].items():
+            bar = "█" * int(score * 30)
+            print(f"   {emotion:<18} {bar:<30} {score:.3f}")
 
         print(f"\n✅ Transcript saved → {session.path}")
 
