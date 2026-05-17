@@ -7,7 +7,6 @@ import pandas as pd
 from datetime import date
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
  
- 
 # ─────────────────────────────────────────────
 # 0. SETUP
 # ─────────────────────────────────────────────
@@ -15,7 +14,7 @@ nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 from nltk.tokenize import sent_tokenize
  
-MODEL_NAME = "SamLowe/roberta-base-go_emotions"
+MODEL_NAME = "pysentimiento/robertuito-emotion-analysis"
 LOCAL_PATH = "./models/go_emotions"
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 16       # safe for 4GB VRAM with float16
@@ -275,4 +274,12 @@ if __name__ == "__main__":
         for emotion, score in r["top_emotions"].items():
             bar = "█" * int(score * 30)
             print(f"   {emotion:<18} {bar:<30} {score:.3f}")
+ 
+    # Step 6 — weekly summary
+    weekly = build_weekly_summary(results)
+    print("\n" + "=" * 60)
+    print("  WEEKLY SUMMARY (key emotions)")
+    print("=" * 60)
+    key_cols = [c for c in ["sadness", "joy", "grief", "nervousness", "gratitude", "alert"] if c in weekly.columns]
+    print(weekly[key_cols].to_string())
  
