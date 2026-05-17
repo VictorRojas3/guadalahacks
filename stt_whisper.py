@@ -178,7 +178,7 @@ def build_payload(person_id: str, analysis: dict) -> dict:
         "label":      top_emotion,
         "confidence": str(confidence),
         "emotions":   analysis["top_emotions"],
-        "summary":    "Lenguaje con calma predominante",
+        "summary":    "Lenguaje profundamente triste",
         "capturedAt": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
