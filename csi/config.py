@@ -1,0 +1,6 @@
+SERIAL_PORT = '/dev/cu.usbserial-0001' 
+BAUD_RATE = 921600 
+WINDOW_SIZE = 25      
+THRESHOLD_MOVE = 3.0       
+THRESHOLD_BRUSCO = 6.0  
+API_BASE_URL = "http://10.43.34.35:8787"
