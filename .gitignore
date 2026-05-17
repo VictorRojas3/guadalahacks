@@ -1,0 +1,23 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos específicos de macOS (Basura del sistema)
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Configuración de VS Code
+.vscode/
+
+# Datos pesados o temporales
+*.wav
+*.mp3
+*.csv
